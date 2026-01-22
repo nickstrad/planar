@@ -3,7 +3,6 @@ import { headers } from "next/headers";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
 import { UserNav } from "./user-nav";
-import { AdminNav } from "@/features/admin/components/admin-nav";
 import { STATIC_PATHS } from "@/lib/constants";
 import { AppLogo } from "@/components/app/AppLogo";
 
@@ -19,7 +18,6 @@ export async function NavBar() {
               <AppLogo />
             </Link>
           </Button>
-          <AdminNav />
         </div>
         <div>
           {session?.user ? (
