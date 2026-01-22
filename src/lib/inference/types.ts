@@ -1,19 +1,13 @@
-# A2 — Inference Contracts & Types
+/**
+ * Inference Contracts & Types
+ *
+ * Core type definitions for the inference runtime (Project A).
+ * These types are consumed by SSE Engine (A3), Adapters (A4), and Executor (A5).
+ */
 
-> **Purpose**: Define the TypeScript types and contracts that form the foundation for all of Project A. These types are consumed by Sections A3 (SSE), A4 (Adapters), and A5 (Executor).
-
-**File location**: `src/lib/inference/types.ts`
-
----
-
-## A2.1 Message and Request Types
-
-### A2.1.1 Define message types
-
-Messages follow the OpenAI-compatible format but are provider-agnostic.
-
-```typescript
-// src/lib/inference/types.ts
+// =============================================================================
+//  Message and Request Types
+// =============================================================================
 
 export type MessageRole = "system" | "user" | "assistant";
 
@@ -22,20 +16,7 @@ export interface Message {
   content: string;
   // Future: tool_calls, tool_call_id for function calling
 }
-```
 
-**Constraints:**
-
-- `content` must be non-empty string
-- `role` is strictly typed (no arbitrary strings)
-
----
-
-### A2.1.2 Define inference options
-
-Options that can be passed to any provider. Provider-specific options are handled separately.
-
-```typescript
 export interface InferenceOptions {
   /** Maximum tokens to generate. Provider default if not specified. */
   maxTokens?: number;
@@ -56,15 +37,7 @@ export const DEFAULT_INFERENCE_OPTIONS: Required<
 > = {
   stream: true,
 };
-```
 
----
-
-### A2.1.3 Define inference request (internal)
-
-This is what Project A receives after Project B has resolved routing.
-
-```typescript
 /**
  * Internal inference request — already has routing resolved.
  * This is NOT the public API request shape (that's Project C).
@@ -79,24 +52,11 @@ export interface InferenceRequest {
   /** Inference options */
   options: InferenceOptions;
 }
-```
 
-**Note**: This type intentionally excludes:
+// =============================================================================
+// Routing Plan Contract
+// =============================================================================
 
-- `tenantId` — owned by Project C
-- `modelAlias` — resolved by Project B before reaching A
-- Quota/billing info — owned by Project C/F
-
----
-
-## A2.2 Routing Plan Contract
-
-> **Deferred to Project B**: Project B owns the `RoutingPlan` and `ResolvedProvider` types.
-> Project A will import these types when integrating with Project B.
-
-For now, Project A defines a minimal interface for what it needs from a resolved provider:
-
-```typescript
 /**
  * Minimal provider info needed by Project A.
  * Project B will extend this with routing metadata (strategy, snapshot, etc.).
@@ -123,17 +83,11 @@ export interface RoutingPlan {
   /** Fallback providers if primary fails (ordered) */
   fallbacks: ResolvedProvider[];
 }
-```
 
----
+// =============================================================================
+// Execution Input/Output Contracts
+// =============================================================================
 
-## A2.3 Execution Input/Output Contracts
-
-### A2.3.1 Define execution input
-
-What the Executor (A5) receives to begin execution.
-
-```typescript
 /**
  * Complete input to the executor.
  * Combines the inference request with resolved routing.
@@ -164,15 +118,7 @@ export const DEFAULT_EXECUTION_CONTROLS: ExecutionControls = {
   timeoutMs: 60_000,
   maxRetries: 1,
 };
-```
 
----
-
-### A2.3.2 Define execution result
-
-What the Executor returns after completion.
-
-```typescript
 /**
  * Result of a completed execution.
  * Returned after streaming is complete.
@@ -210,17 +156,11 @@ export interface ExecutionMetrics {
   /** Number of retry attempts within provider */
   retryCount: number;
 }
-```
 
----
+// =============================================================================
+// Stream Event Types
+// =============================================================================
 
-## A2.4 Stream Event Types
-
-### A2.4.1 Define SSE event types
-
-These types are used by Section A3 (SSE Engine) and emitted by adapters.
-
-```typescript
 /**
  * All possible stream event types.
  * Used for SSE event: field.
@@ -282,20 +222,11 @@ export interface DoneEvent extends BaseStreamEvent {
  * Union of all stream events.
  */
 export type StreamEvent = TokenEvent | MetadataEvent | ErrorEvent | DoneEvent;
-```
 
-**Stream ordering guarantees (enforced by A3):**
+// -----------------------------------------------------------------------------
+// Type guards for stream events
+// -----------------------------------------------------------------------------
 
-1. Zero or more `token` events
-2. Optional `metadata` events (first_token, completion)
-3. Optional `error` event (at most one)
-4. Exactly one `done` event (always last)
-
----
-
-### A2.4.2 Type guards for stream events
-
-```typescript
 /** Type guard for TokenEvent */
 export function isTokenEvent(event: StreamEvent): event is TokenEvent {
   return event.type === "token";
@@ -315,15 +246,11 @@ export function isErrorEvent(event: StreamEvent): event is ErrorEvent {
 export function isDoneEvent(event: StreamEvent): event is DoneEvent {
   return event.type === "done";
 }
-```
 
----
+// =============================================================================
+// A2.5 Error Types
+// =============================================================================
 
-## A2.5 Error Types
-
-### A2.5.1 Define platform error kinds
-
-```typescript
 /**
  * Normalized error kinds across all providers.
  * Used for consistent error handling and retry logic.
@@ -359,13 +286,11 @@ export interface ExecutionError {
     status?: number;
   };
 }
-```
 
----
+// -----------------------------------------------------------------------------
+// Error classification
+// -----------------------------------------------------------------------------
 
-### A2.5.2 Define retryable error classification
-
-```typescript
 /**
  * Errors that can trigger a retry within the same provider.
  */
@@ -400,13 +325,11 @@ export function isRetryableError(error: ExecutionError): boolean {
 export function shouldFallback(error: ExecutionError): boolean {
   return FALLBACK_ERROR_KINDS.has(error.kind);
 }
-```
 
----
+// -----------------------------------------------------------------------------
+// Error factory functions
+// -----------------------------------------------------------------------------
 
-### A2.5.3 Error factory functions
-
-```typescript
 /**
  * Create a normalized execution error.
  */
@@ -444,17 +367,11 @@ export function createTimeoutError(
 export function createCancellationError(providerId: string): ExecutionError {
   return createExecutionError("cancelled", "Request was cancelled", providerId);
 }
-```
 
----
+// =============================================================================
+// A2.6 Provider Adapter Types
+// =============================================================================
 
-## A2.6 Provider Adapter Types
-
-### A2.6.1 Define adapter interface
-
-This interface is implemented by all providers in Section A4.
-
-```typescript
 /**
  * Provider capabilities reported by each adapter.
  * Model-specific capabilities (context length, supported models) are
@@ -502,20 +419,11 @@ export interface ProviderAdapter {
    */
   healthCheck(): Promise<boolean>;
 }
-```
 
-**Design decision**: Adapters only yield `TokenEvent` and throw `ExecutionError` on failure. This provides a single code path for error handling (vs. yielding errors mid-stream). The executor wraps adapter calls and converts thrown errors to `ErrorEvent` for the stream.
+// =============================================================================
+// A2.7 Telemetry Types
+// =============================================================================
 
----
-
-## A2.7 Telemetry Types
-
-> **Deferred to Project D**: Project D owns telemetry event types.
-> Project A will import the telemetry contract from Project D and emit events accordingly.
-
-For now, Project A defines a minimal telemetry emitter interface:
-
-```typescript
 /**
  * Minimal telemetry emitter interface.
  * Project D will provide the concrete implementation and full event types.
@@ -538,89 +446,3 @@ export interface TelemetryEmitter {
 export const noopTelemetryEmitter: TelemetryEmitter = {
   emit: () => {},
 };
-```
-
----
-
-## Summary: Type Dependencies
-
-```
-A2 (Types) ─────────────────────────────────────────────────
-    │
-    ├──► A3 (SSE Engine)
-    │    Uses: StreamEvent, TokenEvent, ErrorEvent, DoneEvent,
-    │          type guards (isTokenEvent, etc.)
-    │
-    ├──► A4 (Adapters)
-    │    Uses: ProviderAdapter, ProviderCapabilities, Message,
-    │          InferenceRequest, ExecutionError, TokenEvent
-    │
-    ├──► A5 (Executor)
-    │    Uses: ExecutionInput, ExecutionResult, ExecutionControls,
-    │          RoutingPlan, ExecutionError, TelemetryEmitter
-    │
-    └──► A6 (Persistence)
-         Uses: ExecutionResult, ExecutionMetrics, ExecutionError
-
-External Dependencies (imported when projects are implemented):
-    ◄── Project B: Full RoutingPlan with strategy/snapshot metadata
-    ◄── Project D: TelemetryEmitter implementation and event types
-```
-
----
-
-## Tasks
-
-### A2.1 Core types
-
-- [x] **A2.1.1 Define Message and MessageRole types**
-- [x] **A2.1.2 Define InferenceOptions with defaults**
-- [x] **A2.1.3 Define InferenceRequest (internal)**
-
-### A2.2 Routing plan contract
-
-- [x] **A2.2.1 Define minimal ResolvedProvider type**
-- [x] **A2.2.2 Define minimal RoutingPlan interface** - Note: Full routing metadata deferred to Project B
-
-### A2.3 Execution contracts
-
-- [x] **A2.3.1 Define ExecutionInput and ExecutionControls**
-- [x] **A2.3.2 Define ExecutionResult and ExecutionMetrics**
-
-### A2.4 Stream event types
-
-- [x] **A2.4.1 Define StreamEventType union**
-- [x] **A2.4.2 Define TokenEvent, MetadataEvent, ErrorEvent, DoneEvent**
-- [x] **A2.4.3 Create type guards for stream events**
-- [x] **A2.4.4 Document stream ordering guarantees**
-
-### A2.5 Error types
-
-- [x] **A2.5.1 Define ErrorKind type**
-- [x] **A2.5.2 Define ExecutionError interface**
-- [x] **A2.5.3 Define isRetryableError and shouldFallback functions**
-- [x] **A2.5.4 Create error factory functions**
-
-### A2.6 Provider adapter types
-
-- [x] **A2.6.1 Define ProviderCapabilities interface**
-- [x] **A2.6.2 Define ProviderAdapter interface**
-
-### A2.7 Telemetry types
-
-- [x] **A2.7.1 Define TelemetryEmitter interface**
-- [x] **A2.7.2 Create noopTelemetryEmitter** - Note: Full telemetry types deferred to Project D
-
----
-
-## A2.8 Unit Tests
-
-**File**: `src/lib/inference/__tests__/types.test.ts`
-
-- [x] **A2.8.1 Create unit tests for error classification** - `isRetryableError` returns true for rate_limit, network_error, timeout - `isRetryableError` returns false for auth_error, cancelled, context_length - `shouldFallback` returns true for provider_error, model_not_found - `shouldFallback` returns false for auth_error, context_length
-
-- [x] **A2.8.2 Create unit tests for error factory functions** - `createExecutionError` creates error with correct kind - `createTimeoutError` creates timeout error with correct message - `createCancellationError` creates cancelled error
-
-- [x] **A2.8.3 Create unit tests for type guards** - `isTokenEvent` correctly identifies token events - `isMetadataEvent` correctly identifies metadata events - `isErrorEvent` correctly identifies error events - `isDoneEvent` correctly identifies done events
-
-- [x] **A2.8.4 Create unit tests for default values** - `DEFAULT_INFERENCE_OPTIONS` has stream: true - `DEFAULT_EXECUTION_CONTROLS` has correct timeoutMs and maxRetries
