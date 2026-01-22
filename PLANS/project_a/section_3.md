@@ -20,7 +20,7 @@ Uses the `StreamEventType` from A2:
 
 // SSE format:
 // event: token
-// data: {"type":"token","timestamp":1234567890,"data":{"token":"Hello","index":0}}
+// data: {"type":"token","timestamp":1234567890,"data":{"token":"Hello"}}
 ```
 
 ---
@@ -50,7 +50,7 @@ export function serializeHeartbeat(): string {
 
 ### A3.1.3 Stream ordering guarantees
 
-Enforced by the stream registry (A3.3):
+Enforced by the Executor (A5), not the SSE layer. The SSE engine is a dumb pipe.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -91,7 +91,7 @@ Enforced by the stream registry (A3.3):
 └─────────────────────────────────────────────────────┘
 ```
 
-**Invariants:**
+**Invariants (enforced by Executor A5):**
 - `done` is ALWAYS emitted (even on error)
 - `done` is ALWAYS last
 - `error` is emitted at most once
@@ -130,7 +130,7 @@ export function createSSEResponse(
 ```typescript
 // src/lib/inference/sse/encoder.ts
 import type { StreamEvent } from "../types";
-import { serializeSSE, serializeHeartbeat } from "./serialize";
+import { serializeSSE } from "./serialize";
 
 /**
  * Create a TransformStream that encodes StreamEvents to SSE format.
@@ -154,18 +154,18 @@ export function createSSEEncoderStream(): TransformStream<StreamEvent, Uint8Arra
 
 ```typescript
 // src/lib/inference/sse/registry.ts
-import type { StreamEvent, DoneEvent } from "../types";
+import type { StreamEvent } from "../types";
 
 export interface StreamRegistry {
   /**
    * Create a new stream for a request.
    * Returns a readable stream for the client.
+   * @param onCancel - Optional callback when client disconnects
    */
-  create(requestId: string): ReadableStream<StreamEvent>;
+  create(requestId: string, onCancel?: () => void): ReadableStream<StreamEvent>;
 
   /**
    * Publish an event to a stream.
-   * Only the executor should call this.
    */
   publish(requestId: string, event: StreamEvent): void;
 
@@ -175,7 +175,7 @@ export interface StreamRegistry {
   close(requestId: string): void;
 
   /**
-   * Check if a stream exists.
+   * Check if a stream exists and is open.
    */
   has(requestId: string): boolean;
 
@@ -195,7 +195,9 @@ export interface StreamMetadata {
 
 ---
 
-### A3.3.2 Implement in-memory stream registry
+### A3.3.2 Implement in-memory stream registry with factory
+
+Uses a factory function pattern for dependency injection and testability:
 
 ```typescript
 // src/lib/inference/sse/registry.ts
@@ -203,87 +205,141 @@ export interface StreamMetadata {
 interface ActiveStream {
   controller: ReadableStreamDefaultController<StreamEvent>;
   metadata: StreamMetadata;
+  onCancel?: () => void;
 }
 
-class InMemoryStreamRegistry implements StreamRegistry {
-  private streams = new Map<string, ActiveStream>();
-  private readonly ttlMs: number;
-
-  constructor(ttlMs = 5 * 60 * 1000) { // 5 minute default TTL
-    this.ttlMs = ttlMs;
-    this.startCleanupInterval();
-  }
-
-  create(requestId: string): ReadableStream<StreamEvent> {
-    if (this.streams.has(requestId)) {
-      throw new Error(`Stream already exists for request ${requestId}`);
-    }
-
-    let controller: ReadableStreamDefaultController<StreamEvent>;
-
-    const stream = new ReadableStream<StreamEvent>({
-      start(c) {
-        controller = c;
-      },
-      cancel: () => {
-        this.close(requestId);
-      },
-    });
-
-    this.streams.set(requestId, {
-      controller: controller!,
-      metadata: {
-        requestId,
-        createdAt: Date.now(),
-        eventCount: 0,
-        closed: false,
-      },
-    });
-
-    return stream;
-  }
-
-  publish(requestId: string, event: StreamEvent): void {
-    const stream = this.streams.get(requestId);
-    if (!stream || stream.metadata.closed) {
-      return; // Silently ignore if stream doesn't exist or is closed
-    }
-
-    stream.controller.enqueue(event);
-    stream.metadata.eventCount++;
-
-    // Auto-close on done event
-    if (event.type === "done") {
-      this.close(requestId);
-    }
-  }
-
-  close(requestId: string): void {
-    const stream = this.streams.get(requestId);
-    if (!stream || stream.metadata.closed) return;
-
-    stream.metadata.closed = true;
-    stream.controller.close();
-  }
-
-  // ... has(), getMetadata(), cleanup interval
+export interface StreamRegistryOptions {
+  /** TTL for stale streams in ms. Default: 5 minutes */
+  ttlMs?: number;
+  /** Cleanup interval in ms. Default: 1 minute */
+  cleanupIntervalMs?: number;
 }
 
-export const streamRegistry = new InMemoryStreamRegistry();
+/**
+ * Create an in-memory stream registry.
+ * Factory function allows multiple instances for testing.
+ */
+export function createStreamRegistry(
+  options: StreamRegistryOptions = {}
+): StreamRegistry {
+  const { ttlMs = 5 * 60 * 1000, cleanupIntervalMs = 60 * 1000 } = options;
+
+  const streams = new Map<string, ActiveStream>();
+  let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startCleanup(): void {
+    if (cleanupTimer) return;
+    cleanupTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [id, stream] of streams) {
+        if (stream.metadata.closed && now - stream.metadata.createdAt > ttlMs) {
+          streams.delete(id);
+        }
+      }
+    }, cleanupIntervalMs);
+  }
+
+  function stopCleanup(): void {
+    if (cleanupTimer) {
+      clearInterval(cleanupTimer);
+      cleanupTimer = null;
+    }
+  }
+
+  // Start cleanup on creation
+  startCleanup();
+
+  const registry: StreamRegistry = {
+    create(requestId: string, onCancel?: () => void): ReadableStream<StreamEvent> {
+      if (streams.has(requestId)) {
+        throw new Error(`Stream already exists for request ${requestId}`);
+      }
+
+      let streamController: ReadableStreamDefaultController<StreamEvent>;
+
+      const stream = new ReadableStream<StreamEvent>({
+        start(controller) {
+          streamController = controller;
+        },
+        cancel() {
+          // Client disconnected
+          registry.close(requestId);
+          onCancel?.();
+        },
+      });
+
+      streams.set(requestId, {
+        controller: streamController!,
+        metadata: {
+          requestId,
+          createdAt: Date.now(),
+          eventCount: 0,
+          closed: false,
+        },
+        onCancel,
+      });
+
+      return stream;
+    },
+
+    publish(requestId: string, event: StreamEvent): void {
+      const stream = streams.get(requestId);
+      if (!stream || stream.metadata.closed) {
+        return; // Silently ignore if stream doesn't exist or is closed
+      }
+
+      stream.controller.enqueue(event);
+      stream.metadata.eventCount++;
+
+      // Auto-close on done event
+      if (event.type === "done") {
+        registry.close(requestId);
+      }
+    },
+
+    close(requestId: string): void {
+      const stream = streams.get(requestId);
+      if (!stream || stream.metadata.closed) return;
+
+      stream.metadata.closed = true;
+      try {
+        stream.controller.close();
+      } catch {
+        // Controller may already be closed
+      }
+    },
+
+    has(requestId: string): boolean {
+      const stream = streams.get(requestId);
+      return stream !== undefined && !stream.metadata.closed;
+    },
+
+    getMetadata(requestId: string): StreamMetadata | null {
+      return streams.get(requestId)?.metadata ?? null;
+    },
+  };
+
+  return registry;
+}
+
+/**
+ * Default stream registry instance.
+ * Use createStreamRegistry() directly for testing.
+ */
+export const streamRegistry = createStreamRegistry();
 ```
 
 ---
 
-## A3.4 Executor Integration
+## A3.4 Stream Publisher
 
-### A3.4.1 Stream publisher interface
+### A3.4.1 Create stream publisher factory
 
-Used by the Executor (A5) to publish events:
+The publisher is a thin wrapper that publishes events to a registry. It has no business logic — ordering guarantees are enforced by the Executor (A5).
 
 ```typescript
 // src/lib/inference/sse/publisher.ts
 import type {
-  StreamEvent,
   TokenEvent,
   MetadataEvent,
   ErrorEvent,
@@ -292,70 +348,78 @@ import type {
   ExecutionError,
   ExecutionMetrics
 } from "../types";
-import { streamRegistry } from "./registry";
+import type { StreamRegistry } from "./registry";
 
-export class StreamPublisher {
-  private tokenIndex = 0;
-  private firstTokenEmitted = false;
+export interface StreamPublisher {
+  /** Emit a token event */
+  emitToken(token: string): void;
 
-  constructor(private readonly requestId: string) {}
+  /** Emit a metadata event */
+  emitMetadata(params: {
+    kind: "first_token" | "completion";
+    metrics?: Partial<ExecutionMetrics>;
+  }): void;
 
-  /**
-   * Emit a token event.
-   */
-  emitToken(token: string): void {
-    const event: TokenEvent = {
-      type: "token",
-      timestamp: Date.now(),
-      data: { token, index: this.tokenIndex++ },
-    };
+  /** Emit an error event */
+  emitError(error: ExecutionError): void;
 
-    // Emit first_token metadata on first token
-    if (!this.firstTokenEmitted) {
-      this.emitMetadata("first_token");
-      this.firstTokenEmitted = true;
-    }
+  /** Emit done event (always last) */
+  emitDone(result: ExecutionResult | null): void;
+}
 
-    streamRegistry.publish(this.requestId, event);
-  }
+export interface CreateStreamPublisherParams {
+  requestId: string;
+  registry: StreamRegistry;
+}
 
-  /**
-   * Emit metadata event.
-   */
-  emitMetadata(kind: "first_token" | "completion", metrics?: Partial<ExecutionMetrics>): void {
-    const event: MetadataEvent = {
-      type: "metadata",
-      timestamp: Date.now(),
-      data: { kind, metrics },
-    };
-    streamRegistry.publish(this.requestId, event);
-  }
+/**
+ * Create a stream publisher for a specific request.
+ */
+export function createStreamPublisher({
+  requestId,
+  registry,
+}: CreateStreamPublisherParams): StreamPublisher {
+  return {
+    emitToken(token: string): void {
+      const event: TokenEvent = {
+        type: "token",
+        timestamp: Date.now(),
+        data: { token },
+      };
+      registry.publish(requestId, event);
+    },
 
-  /**
-   * Emit error event.
-   */
-  emitError(error: ExecutionError): void {
-    const event: ErrorEvent = {
-      type: "error",
-      timestamp: Date.now(),
-      data: { error },
-    };
-    streamRegistry.publish(this.requestId, event);
-  }
+    emitMetadata({ kind, metrics }): void {
+      const event: MetadataEvent = {
+        type: "metadata",
+        timestamp: Date.now(),
+        data: { kind, metrics },
+      };
+      registry.publish(requestId, event);
+    },
 
-  /**
-   * Emit done event (always last).
-   */
-  emitDone(result: ExecutionResult | null): void {
-    const event: DoneEvent = {
-      type: "done",
-      timestamp: Date.now(),
-      data: { result },
-    };
-    streamRegistry.publish(this.requestId, event);
-  }
+    emitError(error: ExecutionError): void {
+      const event: ErrorEvent = {
+        type: "error",
+        timestamp: Date.now(),
+        data: { error },
+      };
+      registry.publish(requestId, event);
+    },
+
+    emitDone(result: ExecutionResult | null): void {
+      const event: DoneEvent = {
+        type: "done",
+        timestamp: Date.now(),
+        data: { result },
+      };
+      registry.publish(requestId, event);
+    },
+  };
 }
 ```
+
+**Design decision**: The publisher is deliberately simple — it just creates and publishes events. All ordering logic (emitting `first_token` metadata, ensuring `done` is always sent) belongs in the Executor (A5). This makes the SSE layer a pure transport concern.
 
 ---
 
@@ -363,13 +427,22 @@ export class StreamPublisher {
 
 ### A3.5.1 Guarantee error → done ordering
 
-The `StreamPublisher` enforces that `emitDone()` is always called, even after errors:
+Ordering guarantees are enforced by the Executor (A5), not the SSE layer:
 
 ```typescript
 // In executor (A5), the pattern is:
+const publisher = createStreamPublisher({ requestId, registry });
+
 try {
-  // ... execute inference
-  publisher.emitMetadata("completion", metrics);
+  // Emit first_token metadata when TTFB is measured
+  publisher.emitMetadata({ kind: "first_token", metrics: { ttfbMs } });
+
+  // ... stream tokens
+  for await (const token of adapter.generate(...)) {
+    publisher.emitToken(token.data.token);
+  }
+
+  publisher.emitMetadata({ kind: "completion", metrics });
   publisher.emitDone(successResult);
 } catch (error) {
   publisher.emitError(normalizedError);
@@ -381,16 +454,125 @@ try {
 
 ### A3.5.2 Handle client disconnects
 
+The registry calls the `onCancel` callback when the client disconnects:
+
 ```typescript
-// The registry's cancel callback handles disconnects
-const stream = new ReadableStream<StreamEvent>({
-  // ...
-  cancel: () => {
-    // Client disconnected
-    this.close(requestId);
-    // Executor receives abort signal via ExecutionControls.signal
-  },
+// In executor or gateway integration:
+const stream = registry.create(requestId, () => {
+  // Client disconnected — abort the execution
+  abortController.abort();
 });
+```
+
+The Executor receives cancellation via `ExecutionControls.signal` (from A2).
+
+---
+
+## A3.6 Integration with tRPC
+
+### A3.6.1 API routing strategy
+
+SSE streaming **cannot** be used in tRPC procedures — tRPC manages its own response serialization and doesn't support raw `Response` objects with custom headers.
+
+**Strategy: tRPC for everything except streaming**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      API Surface                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  /api/trpc/*              → tRPC Router                     │
+│    ├── auth.*             → Authentication (Project C)      │
+│    ├── models.*           → Model catalog (Project B)       │
+│    ├── inference.history  → Request history                 │
+│    └── inference.cancel   → Cancel request                  │
+│                                                             │
+│  /api/v1/infer            → Raw Route Handler (SSE)         │
+│    └── POST               → Streaming inference endpoint    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### A3.6.2 SSE route handler pattern
+
+The streaming endpoint uses a raw Next.js App Router route handler:
+
+```typescript
+// app/api/v1/infer/route.ts (NOT tRPC)
+import { createSSEResponse, createSSEEncoderStream, streamRegistry } from "@/lib/inference/sse";
+import { executeInference } from "@/lib/inference/executor";
+
+export async function POST(request: Request): Promise<Response> {
+  // 1. Parse and validate request (could use shared validation with tRPC)
+  const body = await request.json();
+  const requestId = crypto.randomUUID();
+
+  // 2. Create abort controller for cancellation
+  const abortController = new AbortController();
+
+  // 3. Create stream for client (with cancel callback)
+  const eventStream = streamRegistry.create(requestId, () => {
+    abortController.abort();
+  });
+
+  // 4. Pipe through SSE encoder
+  const encodedStream = eventStream.pipeThrough(createSSEEncoderStream());
+
+  // 5. Start execution in background (fire-and-forget)
+  // Execution publishes events to the stream via StreamPublisher
+  executeInference({
+    requestId,
+    body,
+    signal: abortController.signal,
+  });
+
+  // 6. Return SSE response immediately
+  return createSSEResponse(encodedStream);
+}
+```
+
+### A3.6.3 Shared validation
+
+Request validation can be shared between tRPC and the raw route:
+
+```typescript
+// src/lib/inference/validation.ts
+import { z } from "zod";
+
+export const inferenceRequestSchema = z.object({
+  messages: z.array(messageSchema),
+  options: inferenceOptionsSchema.optional(),
+  // ...
+});
+
+// Used in both:
+// - tRPC procedures (for non-streaming operations)
+// - Raw route handler (for streaming)
+```
+
+> **Note**: Full API design is owned by Project C (Gateway). This section documents how A3's SSE utilities integrate with the routing layer.
+
+---
+
+## A3.7 Module Exports
+
+```typescript
+// src/lib/inference/sse/index.ts
+
+export { serializeSSE, serializeHeartbeat } from "./serialize";
+export { createSSEResponse } from "./response";
+export { createSSEEncoderStream } from "./encoder";
+export {
+  createStreamRegistry,
+  streamRegistry,
+  type StreamRegistry,
+  type StreamMetadata,
+} from "./registry";
+export {
+  createStreamPublisher,
+  type StreamPublisher,
+  type CreateStreamPublisherParams,
+} from "./publisher";
 ```
 
 ---
@@ -399,80 +581,72 @@ const stream = new ReadableStream<StreamEvent>({
 
 ### A3.1 SSE protocol
 
-- [ ] **A3.1.1 Define SSE serialization functions**
-- [ ] **A3.1.2 Document stream ordering guarantees**
+- [x] **A3.1.1 Create SSE serialization functions** (`serialize.ts`)
+- [x] **A3.1.2 Document stream ordering guarantees** (in code comments)
 
 ### A3.2 SSE utilities
 
-- [ ] **A3.2.1 Create SSE response helper for App Router**
-- [ ] **A3.2.2 Create SSE encoder TransformStream**
-- [ ] **A3.2.3 Add heartbeat support**
+- [x] **A3.2.1 Create SSE response helper** (`response.ts`)
+- [x] **A3.2.2 Create SSE encoder TransformStream** (`encoder.ts`)
 
 ### A3.3 Stream registry
 
-- [ ] **A3.3.1 Define StreamRegistry interface**
-- [ ] **A3.3.2 Implement InMemoryStreamRegistry**
-- [ ] **A3.3.3 Add TTL-based cleanup**
-- [ ] **A3.3.4 Enforce single-writer semantics**
+- [x] **A3.3.1 Define StreamRegistry interface**
+- [x] **A3.3.2 Implement createStreamRegistry factory**
+- [x] **A3.3.3 Add TTL-based cleanup for stale streams**
+- [x] **A3.3.4 Export default streamRegistry instance**
 
 ### A3.4 Publisher
 
-- [ ] **A3.4.1 Create StreamPublisher class**
-- [ ] **A3.4.2 Implement token emission with auto-indexing**
-- [ ] **A3.4.3 Implement metadata emission**
-- [ ] **A3.4.4 Implement error and done emission**
+- [x] **A3.4.1 Define StreamPublisher interface**
+- [x] **A3.4.2 Implement createStreamPublisher factory**
 
-### A3.5 Error handling
+### A3.5 Module organization
 
-- [ ] **A3.5.1 Guarantee error → done ordering**
-- [ ] **A3.5.2 Handle client disconnect cleanup**
+- [x] **A3.5.1 Create index.ts with all exports**
 
 ---
 
-## A3.6 Unit Tests
+## A3.8 Unit Tests
 
-**File**: `src/lib/inference/__tests__/sse/`
+**Directory**: `src/lib/inference/__tests__/sse/`
 
-- [ ] **A3.6.1 Test SSE serialization** (`serialize.test.ts`)
+- [x] **A3.8.1 Test SSE serialization** (`serialize.test.ts`)
       - `serializeSSE` produces correct `event:` and `data:` format
       - `serializeSSE` handles all event types (token, metadata, error, done)
       - `serializeHeartbeat` produces valid SSE comment format
       - Output ends with double newline `\n\n`
 
-- [ ] **A3.6.2 Test stream registry** (`registry.test.ts`)
+- [x] **A3.8.2 Test stream registry** (`registry.test.ts`)
       - `create` returns ReadableStream
       - `create` throws if stream already exists for requestId
+      - `create` calls onCancel when client disconnects
       - `publish` enqueues events to correct stream
       - `publish` silently ignores unknown requestId
       - `close` closes the stream controller
       - `close` is idempotent (can be called multiple times)
       - Stream auto-closes on `done` event
       - Events after close are ignored
+      - `has` returns false for closed streams
       - `getMetadata` returns correct eventCount
+      - Factory creates isolated instances (for parallel tests)
 
-- [ ] **A3.6.3 Test stream publisher** (`publisher.test.ts`)
-      - `emitToken` increments token index automatically
-      - `emitToken` emits `first_token` metadata on first token
-      - `emitMetadata` emits with correct kind
-      - `emitError` creates proper error event
-      - `emitDone` always emits done event
-      - Publisher is safe to use after stream closes
-
-- [ ] **A3.6.4 Test ordering guarantees** (`ordering.test.ts`)
-      - Done event is always last
-      - Error followed by done is valid
-      - Multiple tokens followed by done is valid
-      - No events allowed after done
+- [x] **A3.8.3 Test stream publisher** (`publisher.test.ts`)
+      - `emitToken` publishes token event with correct structure
+      - `emitMetadata` publishes metadata event with kind and metrics
+      - `emitError` publishes error event
+      - `emitDone` publishes done event
+      - Publisher uses injected registry (not global)
 
 ---
 
-## A3.7 UI Test Page
+## A3.9 UI Test Page
 
-**Route**: `app/(test)/test/streaming/page.tsx`
+**Route**: `src/app/(test)/test/streaming/page.tsx`
 
 Since SSE streaming behavior is best validated visually, create a test page:
 
-- [ ] **A3.7.1 Create streaming test page**
+- [x] **A3.9.1 Create streaming test page**
       - Button: "Start Mock Stream" - simulates token-by-token streaming
       - Button: "Start Stream with Error" - simulates error mid-stream
       - Button: "Cancel Stream" - tests client disconnect
@@ -480,8 +654,8 @@ Since SSE streaming behavior is best validated visually, create a test page:
       - Display: Event log showing all SSE events received
       - Display: Connection status indicator
 
-- [ ] **A3.7.2 Create mock streaming endpoint**
-      - `app/api/test/stream/route.ts` - returns mock SSE stream
+- [x] **A3.9.2 Create mock streaming endpoint**
+      - `src/app/(test)/api/test/stream/route.ts` - returns mock SSE stream
       - Configurable delay between tokens
       - Option to simulate error at token N
-      - Uses real StreamPublisher and SSE response helpers
+      - Uses createStreamPublisher and createStreamRegistry for isolation
