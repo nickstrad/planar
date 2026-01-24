@@ -75,3 +75,85 @@ model Verification {
   @@index([identifier])
   @@map("verification")
 }
+
+// =============================================================================
+// Project A: Execution Tables
+// =============================================================================
+
+model ExecutionRecord {
+  id        String  @id @default(cuid())
+  requestId String  @unique
+
+  // Final outcome
+  success    Boolean?
+  providerId String?
+  modelId    String?
+
+  // Metrics
+  promptTokens     Int?
+  completionTokens Int?
+  ttfbMs           Int?
+  totalMs          Int?
+
+  // Error (if failed)
+  errorKind    String?
+  errorMessage String?
+
+  // Lifecycle
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  // Relations
+  attempts ExecutionAttempt[]
+
+  // =========================================================================
+  // Project B: Routing fields
+  // =========================================================================
+
+  /// Routing decision snapshot (JSON blob)
+  /// Stores RoutingPlanSnapshot for replay/debugging
+  routingSnapshot Json?
+
+  /// Actual cost after execution (JSON blob)
+  /// Stores ActualCost for billing
+  actualCost Json?
+
+  @@index([requestId])
+  @@index([createdAt])
+  @@map("execution_record")
+}
+
+model ExecutionAttempt {
+  id            String @id @default(cuid())
+  requestId     String
+  attemptNumber Int
+
+  // Provider
+  providerId String
+  modelId    String
+
+  // Outcome
+  success    Boolean?
+  isFallback Boolean  @default(false)
+
+  // Metrics
+  promptTokens     Int?
+  completionTokens Int?
+  ttfbMs           Int?
+  totalMs          Int?
+
+  // Error
+  errorKind    String?
+  errorMessage String?
+
+  // Lifecycle
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  // Relations
+  record ExecutionRecord @relation(fields: [requestId], references: [requestId], onDelete: Cascade)
+
+  @@index([requestId])
+  @@index([providerId])
+  @@map("execution_attempt")
+}
