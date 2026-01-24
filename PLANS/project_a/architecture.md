@@ -166,7 +166,39 @@ If you feel tempted to:
 
 ---
 
-## 9. What "Done" Looks Like for Project A
+## 9. Cross-Project Coordination
+
+### Project B (Router) Dependencies
+
+> **When implementing the `InferenceRequest` table, include these fields for Project B:**
+
+```prisma
+model InferenceRequest {
+  // ... Project A fields ...
+
+  /// Project B: Routing decision snapshot (JSON blob)
+  /// Stores RoutingPlanSnapshot for replay/debugging
+  routingSnapshot    Json?
+
+  /// Project B: Actual cost after execution (JSON blob)
+  /// Stores ActualCost for billing
+  actualCost         Json?
+}
+```
+
+**After adding these fields:**
+1. Run migration: `npx prisma migrate dev`
+2. Notify Project B to update `src/lib/routing/persistence.ts`:
+   - Uncomment Prisma code in `persistRoutingSnapshot()`
+   - Uncomment Prisma code in `loadRoutingSnapshot()`
+   - Uncomment Prisma code in `persistActualCost()`
+3. Update `isPersistenceAvailable()` to return `true`
+
+See: `PLANS/project_b/section_6.md` for full schema details.
+
+---
+
+## 10. What "Done" Looks Like for Project A
 
 - Executor can execute any routing plan
 - All adapters conform to the same interface

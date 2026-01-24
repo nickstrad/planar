@@ -56,3 +56,44 @@
 | C3 | Request Lifecycle Management |
 | C4 | Quotas & Rate Limiting |
 | C5 | Validation & Testing |
+
+---
+
+## Cross-Project Coordination
+
+### Project B (Router) Dependencies
+
+> **When implementing the `Tenant` table, include this field for Project B:**
+
+```prisma
+model Tenant {
+  // ... Project C fields ...
+
+  /// Project B: Tenant-specific routing policy (JSON blob)
+  /// Stores TenantRoutingPolicy for tenant-level routing constraints
+  /// Contains: allowedProviders, deniedProviders, preferredProvider,
+  ///           maxCostPerRequestUsd, defaultStrategy
+  routingPolicy      Json?
+}
+```
+
+**After adding this field:**
+1. Run migration: `npx prisma migrate dev`
+2. Notify Project B to update `src/lib/routing/persistence.ts`:
+   - Uncomment Prisma code in `loadTenantPolicyFromDb()`
+   - Uncomment Prisma code in `saveTenantPolicyToDb()`
+3. Update `isPersistenceAvailable()` to return `true`
+
+**Policy Schema (for validation):**
+```typescript
+interface TenantRoutingPolicy {
+  tenantId: string;
+  allowedProviders?: string[];   // Empty = allow all
+  deniedProviders?: string[];    // Overrides allowed
+  preferredProvider?: string;    // Soft preference
+  maxCostPerRequestUsd?: number;
+  defaultStrategy?: 'cheapest' | 'quality' | 'pinned';
+}
+```
+
+See: `PLANS/project_b/section_6.md` for full schema details.
