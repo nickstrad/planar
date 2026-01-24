@@ -5,6 +5,25 @@
  * These types are consumed by SSE Engine (A3), Adapters (A4), and Executor (A5).
  */
 
+// Import shared types from common module
+import type {
+  ResolvedProvider,
+  RoutingPlan,
+  ProviderCapabilities,
+  ErrorKind,
+  ExecutionError,
+} from "@/lib/common/types";
+
+// Re-export shared types for convenience (consumers can import from either place)
+export type {
+  ResolvedProvider,
+  RoutingPlan,
+  ProviderCapabilities,
+  ErrorKind,
+  ExecutionError,
+};
+export { isRetryableError, shouldFallback } from "@/lib/common/types";
+
 // =============================================================================
 //  Message and Request Types
 // =============================================================================
@@ -53,36 +72,6 @@ export interface InferenceRequest {
   options: InferenceOptions;
 }
 
-// =============================================================================
-// Routing Plan Contract
-// =============================================================================
-
-/**
- * Minimal provider info needed by Project A.
- * Project B will extend this with routing metadata (strategy, snapshot, etc.).
- */
-export interface ResolvedProvider {
-  /** Provider identifier (e.g., "openai", "ollama") */
-  providerId: string;
-
-  /** Model identifier for this provider (e.g., "gpt-4o", "llama3.2") */
-  modelId: string;
-}
-
-/**
- * Minimal routing plan interface for Project A.
- * Project B will define the full RoutingPlan with:
- * - Routing strategy metadata
- * - Resolution snapshot for replay/debugging
- * - Provider-specific options
- */
-export interface RoutingPlan {
-  /** Primary provider to use */
-  primary: ResolvedProvider;
-
-  /** Fallback providers if primary fails (ordered) */
-  fallbacks: ResolvedProvider[];
-}
 
 // =============================================================================
 // Execution Input/Output Contracts
@@ -248,87 +237,8 @@ export function isDoneEvent(event: StreamEvent): event is DoneEvent {
 }
 
 // =============================================================================
-// A2.5 Error Types
+// A2.5 Error Factory Functions
 // =============================================================================
-
-/**
- * Normalized error kinds across all providers.
- * Used for consistent error handling and retry logic.
- */
-export type ErrorKind =
-  | "provider_error" // Provider returned an error
-  | "rate_limit" // Rate limited by provider
-  | "auth_error" // Authentication failed
-  | "model_not_found" // Model doesn't exist
-  | "context_length" // Input too long
-  | "timeout" // Request timed out
-  | "cancelled" // Request was cancelled
-  | "network_error" // Network connectivity issue
-  | "internal_error"; // Platform internal error
-
-/**
- * Execution error with normalized structure.
- */
-export interface ExecutionError {
-  /** Normalized error kind */
-  kind: ErrorKind;
-
-  /** Human-readable message */
-  message: string;
-
-  /** Provider that produced the error */
-  providerId: string;
-
-  /** Original error from provider (for debugging) */
-  providerError?: {
-    code?: string;
-    message?: string;
-    status?: number;
-  };
-}
-
-// -----------------------------------------------------------------------------
-// Error classification
-// -----------------------------------------------------------------------------
-
-/**
- * Errors that can trigger a retry within the same provider.
- */
-const RETRYABLE_ERROR_KINDS: ReadonlySet<ErrorKind> = new Set([
-  "rate_limit",
-  "network_error",
-  "timeout",
-]);
-
-/**
- * Errors that can trigger fallback to next provider.
- * Superset of retryable errors plus some provider-specific failures.
- */
-const FALLBACK_ERROR_KINDS: ReadonlySet<ErrorKind> = new Set([
-  "rate_limit",
-  "network_error",
-  "timeout",
-  "provider_error",
-  "model_not_found",
-]);
-
-/**
- * Check if an error kind should trigger retry within the same provider.
- */
-export function isRetryableError(error: ExecutionError): boolean {
-  return RETRYABLE_ERROR_KINDS.has(error.kind);
-}
-
-/**
- * Check if an error kind should trigger fallback to next provider.
- */
-export function shouldFallback(error: ExecutionError): boolean {
-  return FALLBACK_ERROR_KINDS.has(error.kind);
-}
-
-// -----------------------------------------------------------------------------
-// Error factory functions
-// -----------------------------------------------------------------------------
 
 /**
  * Create a normalized execution error.
@@ -371,19 +281,6 @@ export function createCancellationError(providerId: string): ExecutionError {
 // =============================================================================
 // A2.6 Provider Adapter Types
 // =============================================================================
-
-/**
- * Provider capabilities reported by each adapter.
- * Model-specific capabilities (context length, supported models) are
- * validated by Project B during routing — not duplicated here.
- */
-export interface ProviderCapabilities {
-  /** Whether provider supports streaming */
-  supportsStreaming: boolean;
-
-  /** Whether provider supports function/tool calls */
-  supportsTools: boolean;
-}
 
 /**
  * Adapter interface that all providers must implement.
